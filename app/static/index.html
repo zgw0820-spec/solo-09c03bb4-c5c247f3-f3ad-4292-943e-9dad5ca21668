@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>制品标签查询 · 单飞缓存</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --panel: #171a21;
+    --panel-2: #1e222b;
+    --line: #2b303b;
+    --text: #e8ebf0;
+    --muted: #9aa4b2;
+    --accent: #6aa8ff;
+    --ok: #45c78a;
+    --warn: #e3b341;
+    --bad: #f26d6d;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang SC", sans-serif;
+  }
+  header {
+    padding: 18px 24px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px 20px;
+    align-items: center;
+    justify-content: space-between;
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 650; letter-spacing: .2px; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  main {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 16px;
+    padding: 16px 24px 40px;
+    max-width: 1500px;
+    margin: 0 auto;
+  }
+  section {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  section.wide { grid-column: 1 / -1; }
+  h2 { font-size: 13px; margin: 0 0 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+  label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  input, select, button {
+    font: inherit;
+    color: inherit;
+    background: var(--panel-2);
+    border: 1px solid var(--line);
+    border-radius: 7px;
+    padding: 8px 10px;
+  }
+  input { width: 100%; font-family: var(--mono); font-size: 13px; }
+  input:focus, select:focus { outline: 2px solid rgba(106,168,255,.35); border-color: var(--accent); }
+  button {
+    cursor: pointer;
+    background: #243043;
+    border-color: #33445f;
+    font-weight: 600;
+  }
+  button:hover { background: #2b3a52; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: #24507f; border-color: #2f6aa8; }
+  button.ghost { background: transparent; }
+  .row { display: flex; gap: 8px; align-items: end; flex-wrap: wrap; }
+  .row > .field { flex: 1 1 180px; }
+  .row > .field.small { flex: 0 1 130px; }
+  .stack { display: grid; gap: 12px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 9px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--line);
+    font-size: 12px; color: var(--muted);
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
+  .dot.ok { background: var(--ok); }
+  .dot.bad { background: var(--bad); }
+  .dot.warn { background: var(--warn); }
+  .digest { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  .big { font-size: 26px; font-weight: 650; font-variant-numeric: tabular-nums; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+  .card { background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px; padding: 12px; }
+  .card .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .07em; }
+  .card .v { margin-top: 4px; font-family: var(--mono); font-size: 14px; word-break: break-all; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; }
+  td.mono, .mono { font-family: var(--mono); }
+  .tag-ok { color: var(--ok); }
+  .tag-bad { color: var(--bad); }
+  .tag-warn { color: var(--warn); }
+  .toast {
+    position: fixed; right: 20px; bottom: 20px; max-width: 460px;
+    background: #202631; border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 8px; padding: 12px 14px; font-size: 13px; white-space: pre-wrap;
+    box-shadow: 0 8px 30px rgba(0,0,0,.45); display: none; z-index: 20;
+  }
+  .toast.show { display: block; }
+  .toast.err { border-left-color: var(--bad); }
+  .toast.ok { border-left-color: var(--ok); }
+  pre {
+    background: var(--panel-2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 12px; overflow: auto; font-family: var(--mono); font-size: 12px;
+    max-height: 260px; margin: 0;
+  }
+  .muted { color: var(--muted); }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: 13px; }
+  .kv .k { color: var(--muted); }
+  code { font-family: var(--mono); font-size: 12px; background: var(--panel-2); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>制品标签查询 <span class="muted" style="font-weight:400">· 跨实例单飞缓存</span></h1>
+    <div class="sub">发布标签摘要 → 两个查询实例并发读取 → 同一轮未命中只回源一次</div>
+  </div>
+  <div class="row" style="align-items:center">
+    <span class="pill"><span class="dot" id="healthDot"></span><span id="healthText">检查中…</span></span>
+    <span class="pill" id="instancePill">实例 —</span>
+  </div>
+</header>
+
+<main>
+  <section>
+    <h2>发布标签摘要</h2>
+    <div class="stack">
+      <div class="row">
+        <div class="field">
+          <label for="pubTag">标签</label>
+          <input id="pubTag" value="v1.0.0" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="pubDigest">新摘要</label>
+          <input id="pubDigest" value="sha256:new2222" autocomplete="off" />
+        </div>
+      </div>
+      <div class="row">
+        <div class="field small">
+          <label for="pubInstance">通过实例发布</label>
+          <select id="pubInstance"></select>
+        </div>
+        <div class="field">
+          <label for="pubRequestId">request_id（重试请复用）</label>
+          <input id="pubRequestId" autocomplete="off" />
+        </div>
+      </div>
+      <div class="row">
+        <button class="primary" id="publishBtn">发布并确认</button>
+        <button class="ghost" id="newRequestBtn" type="button">生成新 request_id</button>
+      </div>
+      <div class="hint">发布 = 写源站 + 原子写入缓存并递增发布代号；确认后的查询不会看到旧摘要。重试同一 request_id 不会回退较新发布。</div>
+      <div id="publishResult"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>查询与并发测试</h2>
+    <div class="stack">
+      <div class="row">
+        <div class="field">
+          <label for="queryTag">标签</label>
+          <input id="queryTag" value="v1.0.0" autocomplete="off" />
+        </div>
+        <div class="field small">
+          <label for="parallel">每实例并发数</label>
+          <input id="parallel" type="number" min="1" max="50" value="5" />
+        </div>
+      </div>
+      <div class="row">
+        <button class="primary" id="concurrentBtn">两实例并发查询</button>
+        <button id="singleBtn">查询当前实例</button>
+        <button id="refreshBtn" class="ghost">强制回源（refresh）</button>
+        <button id="invalidateBtn" class="ghost">仅使缓存失效（便于观察单飞）</button>
+      </div>
+      <div class="hint">并发查询会同时向两个实例各发 N 个请求。要观察单飞效果：先点「仅使缓存失效」（不改源站、不改发布代号），再点「两实例并发查询」，此时源站计数应只增加 1（并发到达的强制回源请求同样会被合并为一次）。「强制回源」会跳过新鲜度复检，因此一次已完成回源之后再点它，会再真实回源一次，不适合用来验证单飞。</div>
+      <div id="querySummary"></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>源站模拟</h2>
+    <div class="stack">
+      <div class="row">
+        <div class="field small">
+          <label for="delayMs">响应延迟 (ms)</label>
+          <input id="delayMs" type="number" min="0" max="120000" step="100" value="0" />
+        </div>
+        <button id="applyOriginBtn">应用延迟</button>
+        <div class="field small">
+          <label for="failNext">下 N 次查询失败</label>
+          <input id="failNext" type="number" min="0" max="100" value="0" />
+        </div>
+        <button id="applyFailNextBtn">应用失败</button>
+        <button id="resetCountersBtn" class="ghost">清零计数</button>
+      </div>
+      <div class="cards">
+        <div class="card"><div class="k">源站请求总数</div><div class="v big" id="originCount">—</div></div>
+        <div class="card"><div class="k">当前延迟</div><div class="v" id="originDelay">—</div></div>
+        <div class="card"><div class="k">源站状态</div><div class="v" id="originState">—</div></div>
+      </div>
+      <div class="hint">源站计数由源站自身统计，不依赖查询实例，因此可直接验证一轮并发缓存未命中的真实回源次数。</div>
+    </div>
+  </section>
+
+  <section>
+    <h2>发布状态</h2>
+    <div class="row" style="margin-bottom:10px">
+      <div class="field"><label for="statusTag">标签</label><input id="statusTag" value="v1.0.0" /></div>
+      <button id="statusBtn">刷新状态</button>
+    </div>
+    <div id="statusBody" class="kv"><span class="muted">尚未查询</span></div>
+  </section>
+
+  <section class="wide">
+    <h2>本轮查询明细</h2>
+    <div id="detailWrap"><span class="muted">尚无查询结果</span></div>
+  </section>
+</main>
+
+<div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const state = { instances: [], current: null };
+
+  function esc(value) {
+    return String(value ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+    }[c]));
+  }
+  function toast(message, kind = "") {
+    const el = $("toast");
+    el.textContent = message;
+    el.className = "toast show " + kind;
+    clearTimeout(el._t);
+    el._t = setTimeout(() => { el.className = "toast"; }, 6000);
+  }
+  function newRequestId(prefix = "pub") {
+    const rand = (crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(16).slice(2));
+    return `${prefix}-${rand}`.replace(/[^A-Za-z0-9._:-]/g, "");
+  }
+  async function fetchJson(url, options = {}) {
+    const resp = await fetch(url, {
+      headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+      ...options,
+    });
+    let body = null;
+    try { body = await resp.json(); } catch (_) { body = { error: { message: `HTTP ${resp.status}` } }; }
+    return { ok: resp.ok, status: resp.status, body };
+  }
+  function errText(body, status) {
+    const e = body && body.error;
+    if (e) return `${e.code || "error"} (HTTP ${e.status || status}): ${e.message || ""}${e.retryable ? " · 可重试" : ""}`;
+    return `HTTP ${status}`;
+  }
+
+  async function loadConfig() {
+    const { ok, body } = await fetchJson("/api/config");
+    if (!ok) { toast("无法读取实例配置", "err"); return; }
+    state.current = { name: body.instance, url: location.origin };
+    const list = (body.public_instances || []).slice();
+    const hasCurrent = list.some((u) => u.replace(/\/$/, "") === location.origin);
+    if (!hasCurrent) list.push(location.origin);
+    state.instances = list.map((url) => {
+      const clean = url.replace(/\/$/, "");
+      let name = clean;
+      try { name = new URL(clean).host; } catch (_) { /* keep raw */ }
+      if (clean === location.origin) name = `${body.instance} (当前)`;
+      return { url: clean, name };
+    });
+    const options = state.instances.map((i) => `<option value="${esc(i.url)}">${esc(i.name)}</option>`).join("");
+    $("pubInstance").innerHTML = options;
+    $("instancePill").textContent = `实例 ${body.instance}`;
+    $("healthDot").className = "dot ok";
+    $("healthText").textContent = `Redis/源站配置就绪 · 实例 ${body.instance}`;
+  }
+
+  async function health() {
+    const { ok, body } = await fetchJson("/api/health");
+    const dot = $("healthDot");
+    const text = $("healthText");
+    if (!ok || !body.redis || !body.redis.ok) {
+      dot.className = "dot bad";
+      text.textContent = "Redis 不可用";
+      return;
+    }
+    dot.className = "dot ok";
+    text.textContent = `Redis 正常 · 实例 ${body.instance}`;
+  }
+
+  async function publish() {
+    const tag = $("pubTag").value.trim();
+    const digest = $("pubDigest").value.trim();
+    const base = $("pubInstance").value;
+    const requestId = $("pubRequestId").value.trim() || newRequestId();
+    $("pubRequestId").value = requestId;
+    if (!tag || !digest) { toast("标签和摘要不能为空", "err"); return; }
+    $("publishBtn").disabled = true;
+    $("publishResult").innerHTML = `<span class="muted">发布中…</span>`;
+    try {
+      const { ok, status, body } = await fetchJson(`${base}/api/publish`, {
+        method: "POST",
+        body: JSON.stringify({ tag, digest, request_id: requestId }),
+      });
+      if (!ok) {
+        $("publishResult").innerHTML = `<div class="tag-bad">发布失败：${esc(errText(body, status))}</div>`;
+        toast(`发布未确认：${errText(body, status)}`, "err");
+        return;
+      }
+      const badge = body.status === "confirmed" ? "已确认" : body.status;
+      $("publishResult").innerHTML = `
+        <div class="cards">
+          <div class="card"><div class="k">状态</div><div class="v tag-ok">${esc(badge)}</div></div>
+          <div class="card"><div class="k">摘要</div><div class="v digest">${esc(body.digest)}</div></div>
+          <div class="card"><div class="k">发布代号</div><div class="v">${esc(body.generation)}</div></div>
+          <div class="card"><div class="k">源站版本</div><div class="v">${esc(body.origin_revision)}</div></div>
+        </div>`;
+      toast(`发布已确认 · 代号 ${body.generation} · request_id ${requestId}`, "ok");
+      $("queryTag").value = tag;
+      $("statusTag").value = tag;
+      refreshStatus();
+      refreshStats();
+    } finally {
+      $("publishBtn").disabled = false;
+    }
+  }
+
+  async function queryOne(base, tag, refresh) {
+    const started = performance.now();
+    const { ok, status, body } = await fetchJson(
+      `${base}/api/tag/${encodeURIComponent(tag)}${refresh ? "?refresh=1" : ""}`
+    );
+    return { base, ok, status, body, ms: Math.round(performance.now() - started) };
+  }
+
+  async function runQuery(mode) {
+    const tag = $("queryTag").value.trim();
+    if (!tag) { toast("标签不能为空", "err"); return; }
+    const perInstance = mode === "concurrent"
+      ? Math.max(1, Math.min(50, parseInt($("parallel").value, 10) || 1))
+      : 1;
+    const targets = mode === "single"
+      ? [{ url: location.origin, name: "当前实例" }]
+      : state.instances;
+    const jobs = [];
+    const refresh = mode === "refresh";
+    for (const target of targets) {
+      for (let i = 0; i < perInstance; i += 1) {
+        jobs.push(queryOne(target.url, tag, refresh).then((r) => ({ ...r, instance: target.name })));
+      }
+    }
+    $("querySummary").innerHTML = `<span class="muted">查询中（${jobs.length} 个并发请求）…</span>`;
+    const results = await Promise.all(jobs);
+    renderResults(tag, results, mode);
+    refreshStats();
+    refreshStatus();
+  }
+
+  function renderResults(tag, results, mode) {
+    const okResults = results.filter((r) => r.ok);
+    const digests = new Set(okResults.map((r) => r.body.digest));
+    const leaders = okResults.filter((r) => r.body.single_flight_role === "leader").length;
+    const originCalls = okResults.filter((r) => r.body.origin_called).length;
+    const followers = okResults.filter((r) => r.body.single_flight_role === "follower").length;
+    const hits = okResults.filter((r) => r.body.cache_hit).length;
+    const errors = results.filter((r) => !r.ok);
+    const consistent = digests.size <= 1;
+    const roleCount = okResults.reduce((acc, r) => {
+      acc[r.body.single_flight_role] = (acc[r.body.single_flight_role] || 0) + 1;
+      return acc;
+    }, {});
+    const summary = `
+      <div class="cards" style="margin-bottom:10px">
+        <div class="card"><div class="k">请求数</div><div class="v">${results.length}</div></div>
+        <div class="card"><div class="k">成功 / 错误</div><div class="v"><span class="tag-ok">${okResults.length}</span> / <span class="${errors.length ? "tag-bad" : "muted"}">${errors.length}</span></div></div>
+        <div class="card"><div class="k">缓存命中</div><div class="v">${hits}</div></div>
+        <div class="card"><div class="k">实际回源</div><div class="v">${originCalls}</div></div>
+        <div class="card"><div class="k">领导者 / 等待者</div><div class="v">${leaders} / ${followers}</div></div>
+        <div class="card"><div class="k">摘要一致</div><div class="v ${consistent ? "tag-ok" : "tag-bad"}">${consistent ? (digests.size ? "是" : "无结果") : "否"}</div></div>
+      </div>
+      <div class="hint">模式：${esc(mode)} · 标签 <code>${esc(tag)}</code> · 角色分布 ${esc(JSON.stringify(roleCount))}。「实际回源」为本轮真正向源站发起的查询数，可与源站计数增量核对；领导者可能因复用他人刚写入的结果而为 0。</div>`;
+    const rows = results.map((r) => {
+      if (!r.ok) {
+        const e = (r.body && r.body.error) || {};
+        return `<tr><td>${esc(r.instance)}</td><td class="tag-bad">错误</td><td class="mono">${esc(e.code || "error")}</td>
+          <td colspan="3">${esc(e.message || "")} ${e.retryable ? '<span class="tag-warn">可重试</span>' : ""}</td>
+          <td class="mono">${r.ms}ms</td></tr>`;
+      }
+      const b = r.body;
+      return `<tr>
+        <td>${esc(r.instance)}</td>
+        <td class="mono">${esc(b.digest)}</td>
+        <td>${b.cache_hit ? '<span class="tag-ok">命中</span>' : (b.origin_called ? '<span class="tag-warn">回源</span>' : '<span class="tag-ok">复用</span>')}</td>
+        <td class="mono">${esc(b.single_flight_role)}</td>
+        <td>${esc(b.generation)}</td>
+        <td>${esc((b.publication || {}).status || "")}${b.fenced_by_publish ? ' <span class="tag-warn">发布栅栏</span>' : ""}${b.stale_due_to_pending ? ' <span class="tag-warn">旧值</span>' : ""}</td>
+        <td class="mono">${r.ms}ms</td></tr>`;
+    }).join("");
+    $("detailWrap").innerHTML = `${summary}
+      <table>
+        <thead><tr><th>实例</th><th>摘要</th><th>缓存</th><th>角色</th><th>代号</th><th>发布状态</th><th>耗时</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    $("querySummary").innerHTML = `<div class="hint">最近一轮：${results.length} 请求，${originCalls} 次实际回源，${followers} 等待，${hits} 缓存命中${errors.length ? `，${errors.length} 个错误` : ""}。</div>`;
+    if (errors.length) toast(`本轮有 ${errors.length} 个错误：${errText(errors[0].body, errors[0].status)}`, "err");
+    else if (mode === "concurrent") toast(`并发完成：${originCalls} 次实际回源、${followers} 个等待者、${hits} 次缓存命中`, "ok");
+  }
+
+  async function refreshStats() {
+    // The origin counter is global, so any reachable gateway reports the same
+    // number.  Prefer the local instance, fall back to the listed peers.
+    let body = null;
+    for (const target of [{ url: location.origin }, ...state.instances]) {
+      const res = await fetchJson(`${target.url}/api/stats`);
+      if (res.ok) { body = res.body; break; }
+    }
+    if (!body) { $("originState").textContent = "不可达"; return; }
+    const origin = body.origin || {};
+    $("originCount").textContent = origin.reachable ? (origin.request_count ?? "—") : "不可达";
+    $("originDelay").textContent = origin.reachable ? `${origin.delay_ms ?? 0} ms` : "—";
+    $("originState").textContent = origin.reachable ? "可达" : "不可达";
+    if (origin.reachable && document.activeElement !== $("delayMs")) $("delayMs").value = origin.delay_ms ?? 0;
+  }
+
+  async function applyOrigin() {
+    const payload = {
+      delay_ms: Math.max(0, parseInt($("delayMs").value, 10) || 0),
+    };
+    const { ok, status, body } = await fetchJson("/api/origin/control", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    if (!ok) { toast(`源站设置失败：${errText(body, status)}`, "err"); return; }
+    toast(`源站延迟已设为 ${body.delay_ms}ms`, "ok");
+    refreshStats();
+  }
+
+  async function resetCounters() {
+    const { ok, status, body } = await fetchJson("/api/origin/control", {
+      method: "POST",
+      body: JSON.stringify({ reset_counters: true }),
+    });
+    if (!ok) { toast(`清零失败：${errText(body, status)}`, "err"); return; }
+    toast("源站计数已清零", "ok");
+    refreshStats();
+  }
+
+  async function applyFailNext() {
+    const failNext = parseInt($("failNext").value, 10) || 0;
+    if (failNext <= 0) { toast("请填写大于 0 的失败次数", "err"); return; }
+    const { ok, status, body } = await fetchJson("/api/origin/control", {
+      method: "POST",
+      body: JSON.stringify({ fail_next: failNext }),
+    });
+    if (!ok) { toast(`设置失败：${errText(body, status)}`, "err"); return; }
+    toast(`接下来 ${failNext} 次查询将返回源站错误`, "ok");
+    $("failNext").value = 0;
+  }
+
+  async function invalidate() {
+    const tag = $("queryTag").value.trim();
+    if (!tag) { toast("标签不能为空", "err"); return; }
+    const { ok, status, body } = await fetchJson("/api/cache/invalidate", {
+      method: "POST",
+      body: JSON.stringify({ tag }),
+    });
+    if (!ok) { toast(`失效失败：${errText(body, status)}`, "err"); return; }
+    toast(body.invalidated ? `已使 ${tag} 的缓存失效（保留代号 ${body.generation}），下一轮查询会重新回源` : `${tag} 尚无缓存`, "ok");
+    refreshStats();
+    refreshStatus();
+  }
+
+  async function refreshStatus() {
+    const tag = $("statusTag").value.trim();
+    if (!tag) return;
+    const { ok, body, status } = await fetchJson(`/api/status/${encodeURIComponent(tag)}`);
+    if (!ok) {
+      $("statusBody").innerHTML = `<span class="tag-bad">${esc(errText(body, status))}</span>`;
+      return;
+    }
+    const p = body.publication || {};
+    const last = p.last_publish;
+    const pending = p.pending;
+    $("statusBody").innerHTML = `
+      <span class="k">发布状态</span><span class="${p.status === "confirmed" ? "tag-ok" : p.status === "publishing" ? "tag-warn" : ""}">${esc(p.status)}</span>
+      <span class="k">已确认摘要</span><span class="mono">${esc(body.cached_digest ?? "—")}</span>
+      <span class="k">发布代号</span><span class="mono">${esc(body.generation)}</span>
+      <span class="k">源站版本</span><span class="mono">${esc(body.origin_revision)}</span>
+      <span class="k">缓存时间</span><span class="mono">${esc(body.cached_at ?? "—")}</span>
+      <span class="k">新鲜至</span><span class="mono">${esc(body.fresh_until ?? "—")}</span>
+      <span class="k">最近发布</span><span class="mono">${last ? `${esc(last.digest)} · 代号 ${esc(last.generation)} · ${esc(last.published_at || "")}` : "—"}</span>
+      <span class="k">在途发布</span><span class="mono">${pending ? `${esc(pending.digest)} · 目标代号 ${esc(pending.target_generation)}` : "—"}${pending ? ' <span class="tag-warn">未确认</span>' : ""}</span>`;
+  }
+
+  $("publishBtn").addEventListener("click", publish);
+  $("newRequestBtn").addEventListener("click", () => { $("pubRequestId").value = newRequestId(); });
+  $("concurrentBtn").addEventListener("click", () => runQuery("concurrent").catch((e) => toast(String(e), "err")));
+  $("singleBtn").addEventListener("click", () => runQuery("single").catch((e) => toast(String(e), "err")));
+  $("refreshBtn").addEventListener("click", () => runQuery("refresh").catch((e) => toast(String(e), "err")));
+  $("applyOriginBtn").addEventListener("click", applyOrigin);
+  $("applyFailNextBtn").addEventListener("click", applyFailNext);
+  $("resetCountersBtn").addEventListener("click", resetCounters);
+  $("invalidateBtn").addEventListener("click", invalidate);
+  $("statusBtn").addEventListener("click", refreshStatus);
+
+  $("pubRequestId").value = newRequestId();
+  loadConfig().then(() => { refreshStatus(); refreshStats(); });
+  health();
+  setInterval(() => { health(); refreshStats(); }, 5000);
+})();
+</script>
+</body>
+</html>

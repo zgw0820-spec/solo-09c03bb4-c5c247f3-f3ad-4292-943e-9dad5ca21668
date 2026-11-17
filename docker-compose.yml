@@ -1,0 +1,83 @@
+services:
+  redis:
+    image: redis:7.2-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+    ports:
+      - "6379:6379"
+
+  origin:
+    build: .
+    command:
+      ["uvicorn", "origin.main:app", "--host", "0.0.0.0", "--port", "9000", "--workers", "1"]
+    environment:
+      ORIGIN_SEED: "v1.0.0=sha256:old1111"
+      ORIGIN_DELAY_MS: "0"
+      LOG_LEVEL: "info"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9000/healthz', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "9000:9000"
+
+  # Both query instances are intentionally spelled out in full rather than
+  # using a YAML anchor: ``environment`` is replaced wholesale by anchors, and
+  # an instance silently missing ORIGIN_URL would fall back to localhost.
+  query-1:
+    build: .
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    environment:
+      INSTANCE_NAME: "query-1"
+      REDIS_URL: "redis://redis:6379/0"
+      ORIGIN_URL: "http://origin:9000"
+      PUBLIC_INSTANCES: "http://localhost:8001,http://localhost:8002"
+      ORIGIN_TIMEOUT_MS: "2000"
+      CACHE_WAIT_TIMEOUT_MS: "3500"
+      REVALIDATE_TTL_S: "300"
+    depends_on:
+      redis:
+        condition: service_healthy
+      origin:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "8001:8000"
+
+  query-2:
+    build: .
+    command:
+      ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    environment:
+      INSTANCE_NAME: "query-2"
+      REDIS_URL: "redis://redis:6379/0"
+      ORIGIN_URL: "http://origin:9000"
+      PUBLIC_INSTANCES: "http://localhost:8001,http://localhost:8002"
+      ORIGIN_TIMEOUT_MS: "2000"
+      CACHE_WAIT_TIMEOUT_MS: "3500"
+      REVALIDATE_TTL_S: "300"
+    depends_on:
+      redis:
+        condition: service_healthy
+      origin:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    ports:
+      - "8002:8000"
