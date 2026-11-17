@@ -10,6 +10,8 @@ Redis keys (all prefixed with ``artifact:``)::
     {tag}:last_publish  hash   latest confirmed publication
     {tag}:pub_seq       counter monotonic publication attempt ids
     {tag}:pub_lock      serialises publications for one tag
+    {tag}:events        zset   publication event log (newest 100, cursor-scored)
+    {tag}:events_last   counter newest event cursor ever appended (no TTL)
 
 Correctness rules:
 
@@ -51,6 +53,15 @@ from redis.asyncio import Redis
 from redis.exceptions import RedisError
 
 from .config import Settings
+from .events import (
+    EVENT_POLL_INTERVAL_S,
+    EVENT_RETENTION,
+    EVENT_TTL_MS,
+    MAX_WAIT_MS,
+    EventReadError,
+    EventStore,
+    event_keys,
+)
 
 TAG_RE = re.compile(r"^(?!.*//)[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$")
 DIGEST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/=@-]{0,199}$")
@@ -131,10 +142,10 @@ return {'1', result_seq}
 """
 
 # KEYS[1]=state, 2=pending, 3=fetch_seq, 4=last_publish, 5=result_seq,
-#      6=unconfirmed publication marker
+#      6=unconfirmed publication marker, 7=events zset, 8=events_last counter
 # ARGV: 1 attempt, 2 attempt(for pending match), 3 digest, 4 origin revision,
 #       5 now_ms, 6 fresh_until_ms, 7 request_id, 8 state ttl ms,
-#       9 last_publish ttl seconds
+#       9 last_publish ttl seconds, 10 events ttl ms, 11 retention, 12 tag
 _COMMIT_PUBLISH_LUA = """
 local cur = redis.call('HMGET', KEYS[1], 'gen')
 local cur_gen = tonumber(cur[1] or '0')
@@ -145,8 +156,28 @@ local attempt = tonumber(ARGV[1])
 if attempt <= cur_gen then return {-1, cur_gen} end
 local pending_attempt = redis.call('HGET', KEYS[2], 'attempt_id')
 if pending_attempt and pending_attempt ~= ARGV[2] then return {-2, cur_gen} end
+-- Validate the event log key types *before* mutating anything: a wrong-type
+-- key must fail the whole commit rather than confirm the state and then abort
+-- on ZADD, which in Redis would leave a confirmed publication without its
+-- event (Lua does not roll back earlier writes).
+local events_type = redis.call('TYPE', KEYS[7])['ok']
+if events_type ~= 'zset' and events_type ~= 'none' then return {-3, cur_gen} end
+local counter_type = redis.call('TYPE', KEYS[8])['ok']
+if counter_type ~= 'string' and counter_type ~= 'none' then return {-3, cur_gen} end
 local seq = redis.call('INCR', KEYS[3])
 local result_seq = redis.call('INCR', KEYS[5])
+-- Encode the publication event before mutating any state so a serialisation
+-- failure cannot leave a confirmed publication without its event.
+local cursor = redis.call('INCR', KEYS[8])
+local event = cjson.encode({
+  tag = ARGV[12],
+  type = 'publish_confirmed',
+  cursor = cursor,
+  digest = ARGV[3],
+  generation = tonumber(ARGV[1]),
+  origin_revision = tonumber(ARGV[4]),
+  request_id = ARGV[7],
+  published_at = ARGV[5]})
 redis.call('HSET', KEYS[1],
   'digest', ARGV[3],
   'origin_revision', ARGV[4],
@@ -166,9 +197,18 @@ redis.call('HSET', KEYS[4],
   'request_id', ARGV[7],
   'attempt_id', ARGV[2])
 redis.call('EXPIRE', KEYS[4], ARGV[9])
+-- The publication event is appended in the same atomic step as the confirmed
+-- state, so a confirmed publication can never be missing from the event log
+-- (and an event can never exist without a confirmed state).
+redis.call('ZADD', KEYS[7], cursor, event)
+redis.call('ZREMRANGEBYRANK', KEYS[7], 0, -(tonumber(ARGV[11]) + 1))
+redis.call('PEXPIRE', KEYS[7], ARGV[10])
+-- KEYS[8] (the cursor counter) deliberately has no TTL: a reconnecting
+-- subscriber must be able to detect that its cursor is behind an expired
+-- window instead of mistaking a restarted numbering for continuity.
 if pending_attempt == ARGV[2] then redis.call('DEL', KEYS[2]) end
 redis.call('DEL', KEYS[6])
-return {1, attempt, seq, result_seq}
+return {1, attempt, seq, result_seq, cursor}
 """
 
 # KEYS[1]=fetch_error, 2=result_seq
@@ -209,6 +249,7 @@ class TagService:
         self.redis = redis
         self.origin = origin
         self.s = settings
+        self.events = EventStore(redis)
 
     # ---------------------------------------------------------------- basics
     async def _stat(self, name: str) -> None:
@@ -933,13 +974,15 @@ class TagService:
             try:
                 result = await self.redis.eval(
                     _COMMIT_PUBLISH_LUA,
-                    6,
+                    8,
                     _key(tag, "state"),
                     _key(tag, "pending"),
                     _key(tag, "fetch_seq"),
                     _key(tag, "last_publish"),
                     _key(tag, "result_seq"),
                     _key(tag, "pub_unconfirmed"),
+                    event_keys(tag)[0],
+                    event_keys(tag)[1],
                     str(attempt),
                     str(attempt),
                     digest,
@@ -949,6 +992,9 @@ class TagService:
                     request_id,
                     str(STATE_TTL_MS),
                     str(self.s.publish_record_ttl_s),
+                    str(EVENT_TTL_MS),
+                    str(EVENT_RETENTION),
+                    tag,
                 )
             except RedisError as exc:
                 # The origin accepted the publish; the cache commit is what is
@@ -977,6 +1023,18 @@ class TagService:
                         "current_generation": int((after["state"] or {}).get("gen") or 0),
                     },
                 )
+            if status == -3:
+                # Event log key is unusable, so nothing was committed.  Keep
+                # the unconfirmed marker: the origin accepted the digest but
+                # the gateway cannot confirm it, and readers must not present
+                # the old digest as this publication's result.
+                await self._clear_pending(tag, attempt)
+                raise ServiceError(
+                    "event_log_unavailable",
+                    "源站已更新但发布事件无法登记，发布未确认；请检查缓存状态后用同一 request_id 重试",
+                    503,
+                    retryable=True,
+                )
             if status == -2:
                 await self._clear_publish_state(tag, attempt, clear_unconfirmed=True)
                 raise ServiceError(
@@ -991,6 +1049,7 @@ class TagService:
                 "generation": int(result[1]),
                 "origin_revision": revision,
                 "request_id": request_id,
+                "event_cursor": int(result[4]) if len(result) > 4 else None,
                 "status": "confirmed",
                 "applied": True,
                 "deduplicated": False,
@@ -1158,13 +1217,181 @@ class TagService:
         return {
             "tag": tag,
             "instance": self.s.instance_name,
-            "publication": self._publication(state, snap["pending"], snap["last_publish"]),
+            "publication": self._publication(
+                state, snap["pending"], snap["last_publish"], snap.get("unconfirmed")
+            ),
             "cached_digest": (state or {}).get("digest"),
             "generation": int((state or {}).get("gen") or 0),
             "origin_revision": int((state or {}).get("origin_revision") or 0),
             "cached_at": _iso((state or {}).get("cached_at")),
             "fresh_until": _iso((state or {}).get("fresh_until")),
+            "events_last_cursor": await self.last_event_cursor(tag),
         }
+
+    async def _state_missing(self, tag: str) -> bool:
+        """True when the tag has no confirmed cached state yet."""
+        try:
+            return not bool(await self.redis.exists(_key(tag, "state")))
+        except RedisError as exc:
+            raise ServiceError(
+                "cache_unavailable",
+                f"缓存协调失败，无法读取标签 {tag} 的确认状态（{exc.__class__.__name__}），请重试",
+                503,
+                retryable=True,
+            ) from exc
+
+    async def last_event_cursor(self, tag: str) -> int | None:
+        """Newest event cursor for a tag, or None if it never had an event.
+
+        Used by the page on first load: it subscribes from the current end of
+        the log and shows the already-confirmed digest, rather than replaying
+        history it never asked for.
+        """
+        try:
+            raw = await self.redis.get(event_keys(tag)[1])
+        except RedisError:
+            return None
+        try:
+            return int(raw) if raw not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    # ----------------------------------------------------------------- events
+    def _event_view(self, tag: str, snap) -> dict[str, Any]:
+        """Build the subscription payload from an atomic event/state snapshot."""
+        state = snap.state
+        publication = self._publication(
+            state, snap.pending, snap.last_publish, snap.unconfirmed
+        )
+        events = []
+        for event in snap.entries:
+            events.append(
+                {
+                    "cursor": event.get("cursor"),
+                    "type": event.get("type"),
+                    "tag": event.get("tag"),
+                    "digest": event.get("digest"),
+                    "generation": int(event.get("generation") or 0),
+                    "origin_revision": int(event.get("origin_revision") or 0),
+                    "request_id": event.get("request_id"),
+                    "published_at": _iso(event.get("published_at")),
+                }
+            )
+        return {
+            "tag": tag,
+            "events": events,
+            "last_cursor": snap.last,
+            "retained": snap.retained,
+            "retention_limit": EVENT_RETENTION,
+            "oldest_cursor": snap.oldest,
+            "has_more": snap.has_more,
+            "confirmation": {
+                "digest": (state or {}).get("digest"),
+                "generation": int((state or {}).get("gen") or 0),
+                "origin_revision": int((state or {}).get("origin_revision") or 0),
+                "cached_at": _iso((state or {}).get("cached_at")),
+                "publication": publication,
+            },
+            "instance": self.s.instance_name,
+        }
+
+    async def subscribe(
+        self, tag: str, cursor: int | None, limit: int, wait_ms: int
+    ) -> dict[str, Any]:
+        """Read publication events after ``cursor``, long-polling for new ones.
+
+        * ``cursor is None``: start at the newest event and return immediately.
+          This is the page's first load: it shows the confirmed state and only
+          receives publications that happen from now on.
+        * ``cursor < oldest - 1``: the log was trimmed past the caller's cursor.
+          The response carries ``gap`` metadata plus the current confirmed
+          state; the missing middle is never presented as delivered.
+        * Otherwise events after the cursor are returned.  With no new events
+          and ``wait_ms > 0`` the request long-polls until an event lands, the
+          confirmed state changes, or the wait budget expires.
+        """
+        self.validate_tag(tag)
+        limit = max(1, min(int(limit), EVENT_RETENTION))
+        wait_ms = max(0, min(int(wait_ms), MAX_WAIT_MS))
+        started = time.monotonic()
+        deadline = started + wait_ms / 1000
+        pristine = cursor is None
+        if pristine:
+            newest = await self.last_event_cursor(tag)
+            cursor = newest if newest is not None else 0
+            if await self._state_missing(tag):
+                # First entry on a cold tag: establish the currently confirmed
+                # digest (through the normal single-flight query path) so the
+                # page can show it before any new publication happens.  A tag
+                # that does not exist raises its explicit 404 here rather than
+                # silently showing an empty confirmation.
+                await self.get_tag(tag)
+        cursor = max(0, int(cursor))
+
+        while True:
+            try:
+                snap = await self.events.read(tag, cursor, limit)
+            except EventReadError as exc:
+                raise ServiceError(
+                    "cache_unavailable",
+                    f"缓存协调失败，无法读取发布事件（{exc}），请重试",
+                    503,
+                    retryable=True,
+                ) from exc
+
+            view = self._event_view(tag, snap)
+            view["started_from"] = "latest" if pristine else "cursor"
+            view["requested_cursor"] = cursor
+
+            oldest = snap.oldest
+            gap = None
+            if not pristine and cursor < snap.last:
+                if oldest is not None and cursor < oldest - 1:
+                    missed = oldest - 1 - cursor
+                    available_from = oldest
+                elif oldest is None:
+                    # The whole retained window expired; only the cursor
+                    # counter proves how many publications are gone.
+                    missed = snap.last - cursor
+                    available_from = None
+                else:
+                    missed = 0
+                    available_from = oldest
+                if missed > 0:
+                    gap = {
+                        "detected": True,
+                        "requested_cursor": cursor,
+                        "oldest_available_cursor": available_from,
+                        # Number of publications whose events were trimmed and
+                        # can no longer be delivered.  This is a fact about the
+                        # log, not a claim that those publications were
+                        # recovered.
+                        "missed_publications": missed,
+                        "message": (
+                            "游标早于保留范围：中间的发布事件已无法补齐；"
+                            "以下仅为当前保留事件与当前已确认摘要"
+                        ),
+                    }
+            view["gap"] = gap
+            # A cursor ahead of the newest event means the server's log lost
+            # history (e.g. Redis was flushed).  Say so instead of silently
+            # restarting numbering or replaying retained events as if they
+            # followed that cursor.
+            view["cursor_ahead"] = bool(
+                not pristine and gap is None and cursor > snap.last
+            )
+            if view["cursor_ahead"]:
+                view["cursor_ahead_message"] = (
+                    f"游标 {cursor} 超前于当前最新事件 {snap.last}（事件日志可能被清空），"
+                    "未补发任何历史事件；以下为当前保留事件与当前已确认摘要"
+                )
+            view["waited_ms"] = int((time.monotonic() - started) * 1000)
+
+            if pristine or view["events"] or gap is not None or view["cursor_ahead"]:
+                return view
+            if time.monotonic() >= deadline:
+                return view
+            await asyncio.sleep(EVENT_POLL_INTERVAL_S)
 
     # ------------------------------------------------------------------ stats
     async def gateway_stats(self) -> dict[str, Any]:

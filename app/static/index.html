@@ -225,6 +225,30 @@
   </section>
 
   <section class="wide">
+    <h2>发布事件订阅 · 游标续接</h2>
+    <div class="row">
+      <div class="field">
+        <label for="subTag">标签</label>
+        <input id="subTag" value="v1.0.0" autocomplete="off" />
+      </div>
+      <div class="field small">
+        <label for="subInstance">订阅实例</label>
+        <select id="subInstance"></select>
+      </div>
+      <div class="field small">
+        <label for="subCursorView">续接游标</label>
+        <input id="subCursorView" readonly placeholder="（无，从最新开始）" />
+      </div>
+      <button class="primary" id="subStartBtn">订阅</button>
+      <button class="ghost" id="subStopBtn">断开</button>
+      <button class="ghost" id="subResetBtn">清除本地游标</button>
+    </div>
+    <div class="hint">订阅使用游标续接：首次打开从当前最新游标开始，只显示已确认摘要；收到的每个事件都会推进并保存在本地。刷新页面或断开后重连会按保存的游标补收。若发布数超过每标签 100 条的保留范围，会明确显示缺口并另行读取当前确认状态，不会把中间发布说成已补齐。</div>
+    <div id="subState" style="margin-top:12px"></div>
+    <div id="subFeed" style="margin-top:12px"><span class="muted">尚未订阅</span></div>
+  </section>
+
+  <section class="wide">
     <h2>本轮查询明细</h2>
     <div id="detailWrap"><span class="muted">尚无查询结果</span></div>
   </section>
@@ -284,6 +308,7 @@
     });
     const options = state.instances.map((i) => `<option value="${esc(i.url)}">${esc(i.name)}</option>`).join("");
     $("pubInstance").innerHTML = options;
+    $("subInstance").innerHTML = options;
     $("instancePill").textContent = `实例 ${body.instance}`;
     $("healthDot").className = "dot ok";
     $("healthText").textContent = `Redis/源站配置就绪 · 实例 ${body.instance}`;
@@ -484,6 +509,248 @@
     refreshStatus();
   }
 
+  /** ---------------------------------------------------------------- */
+  /** Publication event subscription with cursor resumption and gap      */
+  /** reporting. The cursor is persisted per tag so a reload reconnects  */
+  /** from the last event actually delivered.                            */
+  /** ---------------------------------------------------------------- */
+  const sub = {
+    tag: null,
+    base: null,
+    instanceName: null,
+    cursor: null,
+    running: false,
+    abort: null,
+    backoffMs: 1000,
+    status: "idle",
+    lastResponse: null,
+    gap: null,
+    events: [],
+    startedFrom: null,
+  };
+
+  function cursorKey(tag) { return `artifact-sub-cursor:v1:${tag}`; }
+  function savedCursor(tag) {
+    try {
+      const raw = localStorage.getItem(cursorKey(tag));
+      if (raw === null || raw === "") return null;
+      const value = parseInt(raw, 10);
+      return Number.isFinite(value) && value >= 0 ? value : null;
+    } catch (_) { return null; }
+  }
+  function storeCursor(tag, cursor) {
+    try { localStorage.setItem(cursorKey(tag), String(cursor)); } catch (_) { /* ignore */ }
+  }
+  function forgetCursor(tag) {
+    try { localStorage.removeItem(cursorKey(tag)); } catch (_) { /* ignore */ }
+  }
+
+  function renderSub() {
+    const statusMap = {
+      idle: ["dot", "未订阅"],
+      live: ["dot ok", "订阅中"],
+      waiting: ["dot ok", "已连接 · 等待新事件"],
+      gap: ["dot warn", "存在缺口"],
+      reconnecting: ["dot warn", "断线重连中"],
+      error: ["dot bad", "错误"],
+    };
+    const [dotClass, label] = statusMap[sub.status] || statusMap.idle;
+    const conf = sub.lastResponse && sub.lastResponse.confirmation;
+    const p = conf && conf.publication;
+    $("subState").innerHTML = `
+      <div class="cards" style="margin-bottom:10px">
+        <div class="card"><div class="k">订阅</div><div class="v"><span class="pill" style="padding:0;border:0;background:none"><span class="${dotClass}"></span> ${esc(label)}</span></div></div>
+        <div class="card"><div class="k">标签</div><div class="v mono">${esc(sub.tag ?? "—")}</div></div>
+        <div class="card"><div class="k">订阅实例</div><div class="v mono">${esc(sub.instanceName ?? "—")}</div></div>
+        <div class="card"><div class="k">续接游标</div><div class="v mono">${sub.cursor === null ? "—" : esc(sub.cursor)}</div></div>
+        <div class="card"><div class="k">已接收事件</div><div class="v">${sub.events.length}</div></div>
+        <div class="card"><div class="k">保留范围</div><div class="v mono">${sub.lastResponse ? `${esc(sub.lastResponse.oldest_cursor ?? "—")} … ${esc(sub.lastResponse.last_cursor ?? "—")}` : "—"}</div></div>
+        <div class="card"><div class="k">每标签保留</div><div class="v">最近 ${esc(sub.lastResponse && sub.lastResponse.retention_limit ? sub.lastResponse.retention_limit : 100)} 条</div></div>
+      </div>
+      <div class="kv">
+        <span class="k">当前已确认摘要</span><span class="mono">${esc(conf ? conf.digest ?? "—" : "—")}</span>
+        <span class="k">发布代号</span><span class="mono">${esc(conf ? conf.generation : "—")}</span>
+        <span class="k">源站版本</span><span class="mono">${esc(conf ? conf.origin_revision : "—")}</span>
+        <span class="k">发布状态</span><span class="${p && p.status === "confirmed" ? "tag-ok" : p && p.status === "publishing" ? "tag-warn" : ""}">${esc(p ? p.status : "—")}</span>
+        <span class="k">起始方式</span><span>${esc(sub.startedFrom === "latest" ? "首次进入：从最新游标开始，只显示已确认摘要" : sub.startedFrom === "cursor" ? "按保存游标续接" : "—")}</span>
+      </div>
+      ${sub.gap ? `<div class="hint" style="color:var(--warn);margin-top:10px">
+        ⚠ 缺口：游标 ${esc(sub.gap.requested_cursor)} 早于保留范围（最早可用 ${esc(sub.gap.oldest_available_cursor ?? "已过期")}），
+        有 ${esc(sub.gap.missed_publications)} 条发布事件已被淘汰、无法补齐。<b>中间发布未补齐</b>；下方「当前已确认摘要」是单独读取的当前状态，不代表这些中间发布已按序送达。
+      </div>` : ""}
+      ${sub.lastResponse && sub.lastResponse.cursor_ahead ? `<div class="hint" style="color:var(--bad);margin-top:10px">
+        ⚠ 游标超前：本地游标 ${esc(sub.cursor)} 大于服务端最新事件 ${esc(sub.lastResponse.last_cursor)}，事件日志可能被清空。未补发任何历史事件，请核对当前已确认摘要后点「清除本地游标」重新订阅。
+      </div>` : ""}`;
+
+    const rows = sub.events.map((e) => `
+      <tr${e.type && e.type !== "publish_confirmed" ? ' class="tag-bad"' : ""}>
+        <td class="mono">${esc(e.cursor)}</td>
+        <td class="mono">${esc(e.digest ?? "—")}${e.type && e.type !== "publish_confirmed" ? ` <span class="tag-bad">(${esc(e.type)}，内容损坏)</span>` : ""}</td>
+        <td>${esc(e.generation)}</td>
+        <td>${esc(e.origin_revision)}</td>
+        <td class="mono">${esc(e.request_id ?? "—")}</td>
+        <td class="mono">${esc(e.published_at ?? "—")}</td>
+      </tr>`).join("");
+    $("subFeed").innerHTML = sub.events.length
+      ? `<table>
+          <thead><tr><th>游标</th><th>摘要</th><th>发布代号</th><th>源站版本</th><th>request_id</th><th>确认时间</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>`
+      : `<span class="muted">${sub.running ? "等待新发布…" : "尚未订阅"}</span>`;
+  }
+
+  function applySubResponse(body) {
+    sub.lastResponse = body;
+    sub.startedFrom = body.started_from;
+    if (body.gap && body.gap.detected) {
+      sub.gap = body.gap;
+      sub.status = "gap";
+    } else if (sub.gap === null) {
+      sub.status = body.events.length ? "live" : "waiting";
+    } else {
+      sub.status = "live";
+    }
+    for (const event of body.events) {
+      // Deduplicate defensively: a replayed cursor must not duplicate rows.
+      if (!sub.events.some((e) => e.cursor === event.cursor)) sub.events.push(event);
+    }
+    sub.events.sort((x, y) => x.cursor - y.cursor);
+    let advanced = false;
+    if (body.started_from === "latest") {
+      // First load: adopt the newest cursor but do not claim old history.
+      sub.cursor = body.last_cursor ?? 0;
+      advanced = true;
+    }
+    for (const event of body.events) {
+      if (sub.cursor === null || event.cursor > sub.cursor) {
+        sub.cursor = event.cursor;
+        advanced = true;
+      }
+    }
+    if (body.cursor_ahead) {
+      // Our cursor is impossible for this log; report it and stop advancing so
+      // the operator can decide (the page offers "清除本地游标").
+      sub.status = "error";
+    } else if (
+      (body.gap && body.gap.detected) &&
+      sub.cursor !== null && body.last_cursor > sub.cursor
+    ) {
+      // Retained events stop short of the current end; move to the end so
+      // future events are delivered, while the gap stays explicitly flagged.
+      sub.cursor = body.last_cursor;
+      advanced = true;
+    }
+    if (sub.cursor !== null) storeCursor(sub.tag, sub.cursor);
+    renderSub();
+    return advanced;
+  }
+
+  async function subWait(ms) {
+    return new Promise((resolve) => {
+      sub.timer = setTimeout(resolve, ms);
+    });
+  }
+
+  function subStop() {
+    sub.running = false;
+    clearTimeout(sub.timer);
+    if (sub.abort) { try { sub.abort.abort(); } catch (_) { /* ignore */ } }
+    sub.abort = null;
+    sub.status = "idle";
+    renderSub();
+  }
+
+  async function subLoop(generation) {
+    while (sub.running && sub.generation === generation) {
+      const params = new URLSearchParams();
+      if (sub.cursor !== null) params.set("cursor", String(sub.cursor));
+      const draining = sub.lastResponse && sub.lastResponse.has_more;
+      params.set("limit", "100");
+      params.set("wait_ms", draining ? "0" : "10000");
+      sub.abort = new AbortController();
+      let ok = false;
+      let body = null;
+      let status = 0;
+      try {
+        const resp = await fetch(
+          `${sub.base}/api/events/${encodeURIComponent(sub.tag)}?${params}`,
+          { signal: sub.abort.signal, cache: "no-store" }
+        );
+        status = resp.status;
+        body = await resp.json().catch(() => null);
+        ok = resp.ok;
+      } catch (err) {
+        if (!sub.running || sub.generation !== generation) return;
+        sub.status = "reconnecting";
+        renderSub();
+        await subWait(sub.backoffMs);
+        sub.backoffMs = Math.min(sub.backoffMs * 2, 5000);
+        continue;
+      }
+      if (!ok || !body) {
+        if (!sub.running || sub.generation !== generation) return;
+        const e = (body && body.error) || {};
+        sub.status = "error";
+        renderSub();
+        toast(`订阅错误：${errText(body, status)}`, "err");
+        if (e.retryable === false) { subStop(); return; }
+        await subWait(sub.backoffMs);
+        sub.backoffMs = Math.min(sub.backoffMs * 2, 5000);
+        continue;
+      }
+      if (!sub.running || sub.generation !== generation) return;
+      sub.backoffMs = 1000;
+      const advanced = applySubResponse(body);
+      if (body.has_more) continue;
+      if (body.cursor_ahead) {
+        // Do not loop on an impossible cursor; wait for the operator to reset.
+        toast(body.cursor_ahead_message || "本地游标超前于服务端事件日志", "err");
+        await subWait(5000);
+        continue;
+      }
+      if (!advanced && !body.events.length) sub.status = sub.gap ? "gap" : "waiting";
+      renderSub();
+      await subWait(250);
+    }
+  }
+
+  async function subStart() {
+    const tag = $("subTag").value.trim();
+    if (!tag) { toast("标签不能为空", "err"); return; }
+    if (sub.running) subStop();
+    sub.tag = tag;
+    sub.base = ($("subInstance").value || location.origin).replace(/\/$/, "");
+    const opt = Array.from($("subInstance").options).find((o) => o.value === sub.base);
+    sub.instanceName = opt ? opt.text : sub.base;
+    sub.cursor = savedCursor(tag);
+    sub.lastResponse = null;
+    sub.gap = null;
+    sub.events = [];
+    sub.backoffMs = 1000;
+    sub.startedFrom = sub.cursor === null ? null : "cursor";
+    sub.running = true;
+    sub.generation = (sub.generation || 0) + 1;
+    sub.status = sub.cursor === null ? "live" : "reconnecting";
+    $("subCursorView").value = sub.cursor === null ? "（无，从最新开始）" : String(sub.cursor);
+    renderSub();
+    if (sub.cursor !== null) {
+      toast(`按保存的游标 ${sub.cursor} 续接订阅 ${tag}`, "ok");
+    }
+    const generation = sub.generation;
+    subLoop(generation).catch((err) => {
+      if (!sub.running || sub.generation !== generation) return;
+      sub.status = "error";
+      renderSub();
+      toast(`订阅中断：${String(err)}`, "err");
+    });
+  }
+
+  function subShowCursor() {
+    const value = $("subTag").value.trim();
+    const saved = value ? savedCursor(value) : null;
+    $("subCursorView").value = saved === null ? "（无，从最新开始）" : String(saved);
+  }
+
   async function refreshStatus() {
     const tag = $("statusTag").value.trim();
     if (!tag) return;
@@ -503,7 +770,8 @@
       <span class="k">缓存时间</span><span class="mono">${esc(body.cached_at ?? "—")}</span>
       <span class="k">新鲜至</span><span class="mono">${esc(body.fresh_until ?? "—")}</span>
       <span class="k">最近发布</span><span class="mono">${last ? `${esc(last.digest)} · 代号 ${esc(last.generation)} · ${esc(last.published_at || "")}` : "—"}</span>
-      <span class="k">在途发布</span><span class="mono">${pending ? `${esc(pending.digest)} · 目标代号 ${esc(pending.target_generation)}` : "—"}${pending ? ' <span class="tag-warn">未确认</span>' : ""}</span>`;
+      <span class="k">在途发布</span><span class="mono">${pending ? `${esc(pending.digest)} · 目标代号 ${esc(pending.target_generation)}` : "—"}${pending ? ' <span class="tag-warn">未确认</span>' : ""}</span>
+      <span class="k">事件游标</span><span class="mono">${esc(body.events_last_cursor ?? "—")}</span>`;
   }
 
   $("publishBtn").addEventListener("click", publish);
@@ -516,9 +784,28 @@
   $("resetCountersBtn").addEventListener("click", resetCounters);
   $("invalidateBtn").addEventListener("click", invalidate);
   $("statusBtn").addEventListener("click", refreshStatus);
+  $("subStartBtn").addEventListener("click", () => subStart().catch((e) => toast(String(e), "err")));
+  $("subStopBtn").addEventListener("click", subStop);
+  $("subResetBtn").addEventListener("click", () => {
+    const tag = $("subTag").value.trim();
+    if (tag) forgetCursor(tag);
+    sub.cursor = null;
+    $("subCursorView").value = "（无，从最新开始）";
+    toast("已清除本地游标；重新订阅将从最新事件开始", "ok");
+    renderSub();
+  });
+  $("subTag").addEventListener("input", subShowCursor);
 
   $("pubRequestId").value = newRequestId();
-  loadConfig().then(() => { refreshStatus(); refreshStats(); });
+  loadConfig().then(() => {
+    refreshStatus();
+    refreshStats();
+    $("subTag").value = $("queryTag").value.trim() || "v1.0.0";
+    subShowCursor();
+    // Auto-subscribe on load: resuming from the saved cursor when present,
+    // otherwise showing the confirmed state and waiting for new publications.
+    subStart().catch(() => {});
+  });
   health();
   setInterval(() => { health(); refreshStats(); }, 5000);
 })();

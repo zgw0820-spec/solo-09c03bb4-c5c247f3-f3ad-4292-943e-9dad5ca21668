@@ -176,6 +176,21 @@ def _register_routes(app: FastAPI) -> None:
         service: TagService = app.state.service
         return await service.status(tag)
 
+    @app.get("/api/events/{tag:path}")
+    async def get_events(
+        tag: str,
+        cursor: int | None = Query(default=None, ge=0),
+        limit: int = Query(default=100, ge=1, le=100),
+        wait_ms: int = Query(default=0, ge=0, le=25_000),
+    ) -> dict[str, Any]:
+        """Publication events after ``cursor`` (long-polls when ``wait_ms`` > 0).
+
+        Omitting ``cursor`` returns the current confirmed state and starts the
+        stream at the newest event, which is what a freshly opened page needs.
+        """
+        service: TagService = app.state.service
+        return await service.subscribe(tag, cursor, limit, wait_ms)
+
     @app.post("/api/publish")
     async def publish(
         body: PublishRequest,

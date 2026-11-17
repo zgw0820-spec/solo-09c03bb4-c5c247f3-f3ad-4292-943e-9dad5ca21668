@@ -501,6 +501,72 @@ async def test_publish_timeout_keeps_unconfirmed_marker(env):
 
 
 @pytest.mark.asyncio
+async def test_cursor_ahead_of_log_is_reported_not_replayed(env):
+    """A cursor beyond the server's newest event must not look like 'caught up'."""
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    await a.publish("v1", "sha256:one", "req-1")
+    view = await b.subscribe("v1", 99, 100, 0)
+    assert view["events"] == []
+    assert view["cursor_ahead"] is True
+    assert "超前" in view["cursor_ahead_message"]
+    assert view["confirmation"]["digest"] == "sha256:one"
+    assert view["gap"] is None
+
+
+@pytest.mark.asyncio
+async def test_cursor_counter_survives_event_window_expiry(env):
+    """The cursor counter must outlive the event window so gaps stay detectable."""
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    await a.publish("v1", "sha256:one", "req-1")
+    assert await redis.pttl("artifact:v1:events") > 0
+    assert await redis.ttl("artifact:v1:events_last") == -1
+    await redis.delete("artifact:v1:events")
+    await a.publish("v1", "sha256:two", "req-2")
+    # Numbering continues (cursor 2, not restarted at 1).
+    view = await b.subscribe("v1", 0, 100, 0)
+    assert view["last_cursor"] == 2
+    assert view["gap"]["detected"] is True
+    assert view["gap"]["missed_publications"] == 1
+    assert [e["cursor"] for e in view["events"]] == [2]
+
+
+@pytest.mark.asyncio
+async def test_publish_is_not_confirmed_when_event_key_is_wrong_type(env):
+    """If the event log cannot be written the publication must not be confirmed."""
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:old")
+    await a.get_tag("v1")
+    await redis.set("artifact:v1:events", "not-a-zset")
+    with pytest.raises(ServiceError) as excinfo:
+        await a.publish("v1", "sha256:new", "req-badlog")
+    assert excinfo.value.code == "event_log_unavailable"
+    assert excinfo.value.retryable is True
+    # Nothing was committed: the confirmed state is untouched and no event or
+    # idempotency record claims success.
+    state = await redis.hgetall("artifact:v1:state")
+    assert state["digest"] == "sha256:old"
+    assert int(state["gen"]) == 0
+    assert await redis.get("artifact:publish_request:v1:req-badlog") is None
+    got = await b.get_tag("v1")
+    assert got["digest"] == "sha256:old"
+    # The unconfirmed marker remains so readers are warned rather than told
+    # the publication succeeded.
+    marker = await redis.hgetall("artifact:v1:pub_unconfirmed")
+    assert marker.get("digest") == "sha256:new"
+
+    # Operator repairs the key; the same request_id now confirms and emits one
+    # event, with no duplicate.
+    await redis.delete("artifact:v1:events")
+    retry = await b.publish("v1", "sha256:new", "req-badlog")
+    assert retry["status"] == "confirmed"
+    assert await redis.zcard("artifact:v1:events") == 1
+    final = await b.get_tag("v1")
+    assert final["digest"] == "sha256:new"
+
+
+@pytest.mark.asyncio
 async def test_request_id_reuse_with_different_digest_rejected(env):
     redis, origin, (a, _b) = env
     origin.seed("v1", "sha256:base")
@@ -512,3 +578,256 @@ async def test_request_id_reuse_with_different_digest_rejected(env):
     assert excinfo.value.code == "request_id_reused"
     got = await a.get_tag("v1")
     assert got["digest"] == "sha256:one"
+
+
+# ---------------------------------------------------------------------- events
+
+
+@pytest.mark.asyncio
+async def test_first_subscribe_establishes_confirmed_state(env):
+    """First entry on a never-queried tag shows the currently confirmed digest."""
+    _redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:existing")
+    view = await b.subscribe("v1", None, 100, 0)
+    assert view["started_from"] == "latest"
+    assert view["events"] == []
+    assert view["gap"] is None
+    assert view["confirmation"]["digest"] == "sha256:existing"
+    assert origin.calls == 1
+    # It used the normal cache path: a second first-entry is a cache hit.
+    again = await a.subscribe("v1", None, 100, 0)
+    assert again["confirmation"]["digest"] == "sha256:existing"
+    assert origin.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_first_subscribe_unknown_tag_is_explicit(env):
+    _redis, origin, (a, _b) = env
+    with pytest.raises(ServiceError) as excinfo:
+        await a.subscribe("missing", None, 100, 0)
+    assert excinfo.value.code == "tag_not_found"
+    assert excinfo.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_event_appended_with_publication(env):
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    published = await a.publish("v1", "sha256:one", "req-e1")
+    assert published["event_cursor"] == 1
+
+    first = await b.subscribe("v1", None, 100, 0)
+    assert [e["cursor"] for e in first["events"]] == []
+    assert first["last_cursor"] == 1
+    assert first["confirmation"]["digest"] == "sha256:one"
+    assert first["started_from"] == "latest"
+
+    second = await b.subscribe("v1", 0, 100, 0)
+    assert [(e["cursor"], e["digest"], e["generation"]) for e in second["events"]] == [
+        (1, "sha256:one", published["generation"])
+    ]
+    assert second["events"][0]["request_id"] == "req-e1"
+    assert second["gap"] is None
+    assert second["last_cursor"] == 1
+
+
+@pytest.mark.asyncio
+async def test_event_only_written_when_publish_confirmed(env):
+    redis, origin, (a, _b) = env
+    origin.seed("v1", "sha256:old")
+    await a.get_tag("v1")
+    origin.publish_fail_next = 1
+    with pytest.raises(ServiceError):
+        await a.publish("v1", "sha256:new", "req-fail")
+    assert await redis.zcard("artifact:v1:events") == 0
+    assert await redis.get("artifact:v1:events_last") is None
+
+    # A cache commit failure after the origin accepted must also not append:
+    # the publication is not confirmed, so it must not be announced.
+    origin.publish_fail_next = 0
+    real_eval = redis.eval
+
+    async def eval_hook(script, *args, **kwargs):
+        if "if attempt <= cur_gen" in script:
+            raise RedisConnectionError("simulated commit failure")
+        return await real_eval(script, *args, **kwargs)
+
+    redis.eval = eval_hook
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            await a.publish("v1", "sha256:new", "req-crash")
+        assert excinfo.value.code == "cache_unavailable"
+    finally:
+        redis.eval = real_eval
+    assert await redis.zcard("artifact:v1:events") == 0
+
+    retry = await a.publish("v1", "sha256:new", "req-crash")
+    assert retry["status"] == "confirmed"
+    assert await redis.zcard("artifact:v1:events") == 1
+
+
+@pytest.mark.asyncio
+async def test_idempotent_publish_does_not_duplicate_event(env):
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    first = await a.publish("v1", "sha256:one", "req-idem")
+    again_one = await b.publish("v1", "sha256:one", "req-idem")
+    again_two = await a.publish("v1", "sha256:one", "req-idem")
+    assert first["status"] == "confirmed"
+    assert again_one["status"] == "already_applied"
+    assert again_two["status"] == "already_applied"
+    assert await redis.zcard("artifact:v1:events") == 1
+    view = await b.subscribe("v1", 0, 100, 0)
+    assert len(view["events"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_retention_keeps_newest_100_and_reports_gap(env):
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    for index in range(105):
+        await a.publish("v1", f"sha256:d{index}", f"req-{index}")
+    assert await redis.zcard("artifact:v1:events") == 100
+
+    latest = await b.subscribe("v1", None, 100, 0)
+    assert latest["last_cursor"] == 105
+    assert latest["retained"] == 100
+    assert latest["oldest_cursor"] == 6
+    assert latest["events"] == []
+    assert latest["gap"] is None
+
+    # Cursor 0 is far outside the retained window: explicit gap, and the
+    # response must not pretend publications 1-5 were delivered.
+    gap = await b.subscribe("v1", 0, 100, 0)
+    assert gap["gap"] is not None
+    assert gap["gap"]["detected"] is True
+    assert gap["gap"]["missed_publications"] == 5
+    assert gap["gap"]["oldest_available_cursor"] == 6
+    assert [e["cursor"] for e in gap["events"]] == list(range(6, 106))
+    assert gap["confirmation"]["digest"] == "sha256:d104"
+
+    # Exactly at the boundary nothing is missing.
+    exact = await b.subscribe("v1", 5, 100, 0)
+    assert exact["gap"] is None
+    assert [e["cursor"] for e in exact["events"]] == list(range(6, 106))
+
+    # Cursor at the newest event: caught up, no gap.
+    caught_up = await b.subscribe("v1", 105, 100, 0)
+    assert caught_up["gap"] is None
+    assert caught_up["events"] == []
+
+
+@pytest.mark.asyncio
+async def test_cursor_beyond_last_after_empty_window_is_not_a_gap(env):
+    """An expired event window must not invent a gap or replay old events."""
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    await a.publish("v1", "sha256:one", "req-1")
+    await redis.delete("artifact:v1:events")  # window expired, counter kept
+    view = await b.subscribe("v1", 1, 100, 0)
+    assert view["events"] == []
+    assert view["gap"] is None
+    assert view["oldest_cursor"] is None
+    assert view["last_cursor"] == 1
+    assert view["confirmation"]["digest"] == "sha256:one"
+
+
+@pytest.mark.asyncio
+async def test_expired_window_reports_gap_when_cursor_behind(env):
+    """With the whole window gone, a lagging cursor still gets an explicit gap."""
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    await a.publish("v1", "sha256:one", "req-1")
+    await a.publish("v1", "sha256:two", "req-2")
+    await redis.delete("artifact:v1:events")
+    view = await b.subscribe("v1", 1, 100, 0)
+    assert view["events"] == []
+    assert view["gap"]["detected"] is True
+    assert view["gap"]["missed_publications"] == 1
+    assert view["gap"]["oldest_available_cursor"] is None
+    assert view["confirmation"]["digest"] == "sha256:two"
+    assert view["last_cursor"] == 2
+
+
+@pytest.mark.asyncio
+async def test_long_poll_returns_new_event_promptly(env):
+    """Long-poll latency: the event is delivered as soon as it exists."""
+    import time as _time
+
+    _redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    await a.publish("v1", "sha256:one", "req-1")
+
+    async def publish_later():
+        await asyncio.sleep(0.15)
+        return await b.publish("v1", "sha256:two", "req-2")
+
+    started = _time.monotonic()
+    waiter, published = await asyncio.gather(
+        a.subscribe("v1", 1, 100, 5000), publish_later()
+    )
+    elapsed = _time.monotonic() - started
+    assert published["status"] == "confirmed"
+    assert [e["cursor"] for e in waiter["events"]] == [2]
+    assert waiter["events"][0]["digest"] == "sha256:two"
+    assert waiter["confirmation"]["digest"] == "sha256:two"
+    assert waiter["has_more"] is False
+    assert elapsed < 2.0
+
+    # The client resumes from the event cursor and is caught up immediately.
+    caught_up = await a.subscribe("v1", 2, 100, 200)
+    assert caught_up["events"] == []
+    assert caught_up["gap"] is None
+
+
+@pytest.mark.asyncio
+async def test_long_poll_times_out_without_events(env):
+    import time as _time
+
+    origin, (a, _b) = FakeOrigin(), env[2]
+    origin.seed("v1", "sha256:base")
+    await a.publish("v1", "sha256:one", "req-1")
+    started = _time.monotonic()
+    view = await a.subscribe("v1", 1, 100, 300)
+    elapsed = _time.monotonic() - started
+    assert view["events"] == []
+    assert 0.25 <= elapsed < 2.0
+    assert view["gap"] is None
+    assert view["confirmation"]["digest"] == "sha256:one"
+
+
+@pytest.mark.asyncio
+async def test_subscribe_paginates_with_has_more(env):
+    _redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+    for index in range(5):
+        await a.publish("v1", f"sha256:d{index}", f"req-{index}")
+    page = await b.subscribe("v1", 0, 2, 0)
+    assert [e["cursor"] for e in page["events"]] == [1, 2]
+    assert page["has_more"] is True
+    nxt = await b.subscribe("v1", 2, 2, 0)
+    assert [e["cursor"] for e in nxt["events"]] == [3, 4]
+    assert nxt["has_more"] is True
+    last = await b.subscribe("v1", 4, 2, 0)
+    assert [e["cursor"] for e in last["events"]] == [5]
+    assert last["has_more"] is False
+
+
+@pytest.mark.asyncio
+async def test_event_state_and_confirmation_are_atomic(env):
+    """A concurrent publish can never yield events newer than the state shown."""
+    _redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:base")
+
+    async def publish_many(service, prefix):
+        for index in range(20):
+            await service.publish("v1", f"sha256:{prefix}{index}", f"{prefix}-{index}")
+
+    await asyncio.gather(publish_many(a, "a"), publish_many(b, "b"))
+    view = await b.subscribe("v1", 0, 100, 0)
+    assert len(view["events"]) == 40
+    assert view["gap"] is None
+    newest = view["events"][-1]
+    assert newest["generation"] == 40
+    assert newest["digest"] == view["confirmation"]["digest"]
+    assert newest["generation"] == view["confirmation"]["generation"]

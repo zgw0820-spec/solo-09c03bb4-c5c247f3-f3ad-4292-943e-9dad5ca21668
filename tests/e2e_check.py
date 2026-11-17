@@ -181,6 +181,155 @@ async def main() -> int:
     bad_digest = await q1.post("/api/publish", json={"tag": "ok-tag", "digest": "bad digest"})
     check(bad_digest.status_code == 422, f"非法摘要返回 422（实际 {bad_digest.status_code}）")
 
+    # ------------------------------------------------- 10. event subscription
+    ev_tag = tag("e2e-events")
+    await reset(origin, ev_tag, "sha256:seed")
+    first_pub = (
+        await q1.post(
+            "/api/publish",
+            json={"tag": ev_tag, "digest": "sha256:ev1", "request_id": request_id("ev-1")},
+        )
+    ).json()
+    newest = (await q2.get(f"/api/events/{ev_tag}")).json()
+    check(newest["started_from"] == "latest", "首次订阅从最新游标开始")
+    check(newest["events"] == [], "首次订阅不重放历史事件")
+    check(newest["confirmation"]["digest"] == "sha256:ev1", "首次订阅显示当前已确认摘要")
+    check(newest["confirmation"]["generation"] == first_pub["generation"], "首次订阅显示发布代号")
+    check(newest["last_cursor"] == first_pub["event_cursor"], "首次订阅给出续接游标")
+
+    # A subscriber on query-1 waiting with cursor 0 must receive the event
+    # published through query-2, promptly and with the right digest/cursor.
+    # The long poll returns as soon as at least one event exists (low latency);
+    # the client re-polls with the new cursor, which is what the page does.
+    async def publish_from_q2():
+        await asyncio.sleep(0.3)
+        return await q2.post(
+            "/api/publish",
+            json={"tag": ev_tag, "digest": "sha256:ev2", "request_id": request_id("ev-2")},
+        )
+
+    async def drain_from(q, tag_name, cursor, target_digest, timeout_s=8.0):
+        seen = []
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_s
+        while loop.time() < deadline:
+            body = (
+                await q.get(
+                    f"/api/events/{tag_name}?cursor={cursor}&wait_ms=4000"
+                )
+            ).json()
+            seen.extend(body["events"])
+            cursor = max([cursor, *[e["cursor"] for e in body["events"]]])
+            if any(e["digest"] == target_digest for e in seen):
+                return body, seen, cursor
+            if body.get("cursor_ahead") or body.get("gap"):
+                return body, seen, cursor
+        return body, seen, cursor
+
+    waiter, second_pub = await asyncio.gather(
+        drain_from(q1, ev_tag, 0, "sha256:ev2"),
+        publish_from_q2(),
+    )
+    latest_poll, received, reconnect_cursor = waiter
+    second_body = second_pub.json()
+    cursors = [e["cursor"] for e in received]
+    check(second_pub.status_code == 200, "跨实例发布成功")
+    check(cursors == [first_pub["event_cursor"], second_body.get("event_cursor")],
+          f"订阅按游标收到两条事件（实际 {cursors}）")
+    check([e["digest"] for e in received] == ["sha256:ev1", "sha256:ev2"],
+          "事件摘要按发布顺序送达")
+    check(latest_poll["confirmation"]["digest"] == "sha256:ev2",
+          "事件送达时确认状态已更新为新摘要")
+    check(received[-1]["generation"] == second_body["generation"], "事件携带发布代号")
+    check(received[-1]["request_id"] == request_id("ev-2"), "事件携带 request_id")
+    check(received[-1]["cursor"] == reconnect_cursor, "续接游标指向最后收到的事件")
+
+    # Reconnect with the newest cursor: nothing replayed, no gap.
+    caught_up = (await q1.get(f"/api/events/{ev_tag}?cursor={reconnect_cursor}")).json()
+    check(caught_up["events"] == [] and caught_up["gap"] is None, "按最新游标重连不重复、无缺口")
+
+    # Idempotent retry must not append a second event.
+    retry = await q1.post(
+        "/api/publish",
+        json={"tag": ev_tag, "digest": "sha256:ev2", "request_id": request_id("ev-2")},
+    )
+    retry_body = retry.json()
+    check(retry_body["status"] == "already_applied", "重复 request_id 返回 already_applied")
+    after_retry = (await q2.get(f"/api/events/{ev_tag}?cursor=0")).json()
+    check(len(after_retry["events"]) == 2, f"幂等重试不重复通知（实际 {len(after_retry['events'])} 条）")
+
+    # Failed publish (origin refuses) must not produce an event.
+    await reset(origin, tag("e2e-ev-fail"), "sha256:keep")
+    await q1.get(f"/api/tag/{tag('e2e-ev-fail')}")
+    await origin.post("/control", json={"fail_publish_next": 1})
+    failed_pub = await q1.post(
+        "/api/publish",
+        json={"tag": tag("e2e-ev-fail"), "digest": "sha256:lost", "request_id": request_id("ev-fail")},
+    )
+    check(failed_pub.status_code >= 400, "源站拒绝发布时返回错误")
+    failed_events = (await q2.get(f"/api/events/{tag('e2e-ev-fail')}?cursor=0")).json()
+    check(failed_events["events"] == [], "发布失败不发送成功事件")
+    check(failed_events["last_cursor"] == 0, "发布失败不推进游标")
+
+    # Same for a timeout at the origin (unknown outcome): the publication is
+    # not confirmed, so no success event may be delivered.
+    await reset(origin, tag("e2e-ev-timeout"), "sha256:keep2")
+    await q1.get(f"/api/tag/{tag('e2e-ev-timeout')}")
+    await origin.post("/control", json={"publish_delay_ms": 6000})
+    timed_out_pub = await q1.post(
+        "/api/publish",
+        json={
+            "tag": tag("e2e-ev-timeout"),
+            "digest": "sha256:slowlost",
+            "request_id": request_id("ev-timeout"),
+        },
+    )
+    check(timed_out_pub.status_code == 504, f"发布确认超时返回 504（实际 {timed_out_pub.status_code}）")
+    timeout_events = (await q2.get(f"/api/events/{tag('e2e-ev-timeout')}?cursor=0")).json()
+    check(timeout_events["events"] == [], "发布超时未确认时不发送成功事件")
+    timeout_status = (await q2.get(f"/api/status/{tag('e2e-ev-timeout')}")).json()
+    check(timeout_status["publication"]["status"] == "publishing",
+          "发布超时后状态明确为未确认（publishing）")
+    await origin.post("/control", json={"publish_delay_ms": 0})
+
+    # Retention: 105 confirmed publications keep only the newest 100 events.
+    ret_tag = tag("e2e-ev-retention")
+    await reset(origin, ret_tag, "sha256:seed")
+    for index in range(105):
+        response = await q1.post(
+            "/api/publish",
+            json={"tag": ret_tag, "digest": f"sha256:r{index}", "request_id": f"ret-{index}-{run}"},
+        )
+        if response.status_code != 200:
+            check(False, f"第 {index} 次发布用于保留测试时失败: {response.text}")
+            break
+    retention = (await q2.get(f"/api/events/{ret_tag}?cursor=0")).json()
+    check(retention["retained"] == 100, f"每标签仅保留最近 100 条事件（实际 {retention['retained']}）")
+    check(len(retention["events"]) == 100, f"读取返回 100 条（实际 {len(retention['events'])}）")
+    check(retention["last_cursor"] == 105, f"最新游标为 105（实际 {retention['last_cursor']}）")
+    check(retention["oldest_cursor"] == 6, f"最旧保留游标为 6（实际 {retention['oldest_cursor']}）")
+    gap_body = retention
+    check(gap_body["gap"] is not None and gap_body["gap"]["detected"] is True,
+          "游标超出保留范围时明确报告缺口")
+    check(gap_body["gap"]["missed_publications"] == 5,
+          f"缺口数量明确为 5（实际 {gap_body['gap']['missed_publications']}）")
+    check(gap_body["gap"]["oldest_available_cursor"] == 6, "缺口报告最早可用游标")
+    check([e["cursor"] for e in gap_body["events"]] == list(range(6, 106)),
+          "缺口中只返回仍保留的事件")
+    check(gap_body["confirmation"]["digest"] == "sha256:r104", "缺口响应附带当前确认状态（最新摘要）")
+    check(gap_body["confirmation"]["digest"] != gap_body["events"][0]["digest"],
+          "未把中间发布说成已补齐：缺口与当前确认状态分开呈现")
+
+    # A cursor exactly at the retention boundary has no gap.
+    boundary = (await q1.get(f"/api/events/{ret_tag}?cursor=5")).json()
+    check(boundary["gap"] is None and len(boundary["events"]) == 100,
+          "游标刚好在保留边界时不报缺口")
+
+    # Reconnect mid-stream: events after a saved cursor are the missing tail.
+    reconnect = (await q1.get(f"/api/events/{ret_tag}?cursor=102")).json()
+    check([e["cursor"] for e in reconnect["events"]] == [103, 104, 105],
+          "断线重连按游标补收尾部事件")
+
     await q1.aclose()
     await q2.aclose()
     await origin.aclose()
